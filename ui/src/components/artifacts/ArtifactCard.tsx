@@ -1,7 +1,8 @@
 import { type SyntheticEvent, useEffect, useRef, useState } from "react";
-import { Download, ExternalLink, Paperclip, Play } from "lucide-react";
+import { Download, ExternalLink, Paperclip, Play, Printer } from "lucide-react";
 import type { CompanyArtifact } from "@/api/artifacts";
 import { Link } from "@/lib/router";
+import { printArtifact } from "@/lib/print-artifact";
 import { cn, formatDate } from "@/lib/utils";
 
 interface ArtifactCardProps {
@@ -167,17 +168,40 @@ export function ArtifactPreview({ artifact }: { artifact: PreviewArtifact }) {
   }
 }
 
+const SECONDARY_ACTION_CLASS =
+  "flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground";
+
 function SecondaryAction({
   href,
   download,
   title,
+  onClick,
   children,
 }: {
-  href: string;
+  href?: string;
   download?: boolean;
   title: string;
+  onClick?: () => void;
   children: React.ReactNode;
 }) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        title={title}
+        aria-label={title}
+        onClick={(event) => {
+          event.stopPropagation();
+          event.preventDefault();
+          onClick();
+        }}
+        className={SECONDARY_ACTION_CLASS}
+      >
+        {children}
+      </button>
+    );
+  }
+
   return (
     <a
       href={href}
@@ -185,7 +209,7 @@ function SecondaryAction({
       title={title}
       aria-label={title}
       onClick={(event) => event.stopPropagation()}
-      className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+      className={SECONDARY_ACTION_CLASS}
     >
       {children}
     </a>
@@ -212,7 +236,7 @@ export function ArtifactCard({ artifact }: ArtifactCardProps) {
           >
             {artifact.title}
           </h3>
-          <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+          <div className="flex shrink-0 items-center gap-0.5">
             {artifact.openPath ? (
               <SecondaryAction href={artifact.openPath} title="Open file in new tab">
                 <ExternalLink className="h-3.5 w-3.5" />
@@ -223,6 +247,12 @@ export function ArtifactCard({ artifact }: ArtifactCardProps) {
                 <Download className="h-3.5 w-3.5" />
               </SecondaryAction>
             ) : null}
+            <SecondaryAction
+              onClick={() => printArtifact(artifact)}
+              title="Print file"
+            >
+              <Printer className="h-3.5 w-3.5" />
+            </SecondaryAction>
           </div>
         </div>
 
