@@ -295,15 +295,51 @@ function writePrintableShell(target: Window, title: string, bodyHtml: string): v
   documentRef.close();
 }
 
+/** Let the viewer paint before printing: `load` can fire before the first frame. */
+const PRINT_SETTLE_MS = 450;
+/** Never leave a tab silently unprinted when the load event does not arrive. */
+const PRINT_LOAD_TIMEOUT_MS = 5_000;
+
+function printWindow(target: Window): void {
+  try {
+    target.focus();
+    target.print();
+  } catch {
+    // The tab is open with the artifact in it; the user can print it directly.
+  }
+}
+
+/** Print a shell this module wrote itself: the document is already complete. */
 function printWhenReady(target: Window): void {
-  window.setTimeout(() => {
-    try {
-      target.focus();
-      target.print();
-    } catch {
-      // The tab is open with the artifact in it; the user can print it directly.
-    }
-  }, 450);
+  window.setTimeout(() => printWindow(target), PRINT_SETTLE_MS);
+}
+
+/**
+ * Print a tab that has been navigated to a file URL, once that file has loaded.
+ *
+ * A fixed delay is not enough here: a PDF or an image that takes longer than the
+ * delay is still loading when the timer fires, and `print()` then produces blank
+ * pages. Wait for the document's `load` event, then let the viewer paint. The
+ * timer stays as a fallback so a document that never reports `load` — or a
+ * cross-origin one, whose events are unreachable — is still printed rather than
+ * silently doing nothing.
+ */
+function printAfterLoad(target: Window): void {
+  let printed = false;
+  const fire = () => {
+    if (printed) return;
+    printed = true;
+    printWindow(target);
+  };
+  const settle = () => window.setTimeout(fire, PRINT_SETTLE_MS);
+
+  try {
+    target.addEventListener("load", settle, { once: true });
+  } catch {
+    // Cross-origin document: the event is unreachable, so the timer decides.
+  }
+
+  window.setTimeout(fire, PRINT_LOAD_TIMEOUT_MS);
 }
 
 /**
@@ -349,7 +385,7 @@ export function printArtifact(artifact: CompanyArtifact): void {
 
   if (plan === "inline") {
     target.location.replace(source.url);
-    printWhenReady(target);
+    printAfterLoad(target);
     return;
   }
 
