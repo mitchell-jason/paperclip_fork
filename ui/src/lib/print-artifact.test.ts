@@ -203,10 +203,13 @@ type FakeTarget = {
   focus: ReturnType<typeof vi.fn>;
   print: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  addEventListener: ReturnType<typeof vi.fn>;
+  dispatchLoad: () => void;
 };
 
 function fakeTarget(): { target: FakeTarget; written: () => string } {
   const writes: string[] = [];
+  const loadListeners: Array<() => void> = [];
   const target: FakeTarget = {
     document: {
       open: vi.fn(),
@@ -217,6 +220,10 @@ function fakeTarget(): { target: FakeTarget; written: () => string } {
     focus: vi.fn(),
     print: vi.fn(),
     close: vi.fn(),
+    addEventListener: vi.fn((type: string, listener: () => void) => {
+      if (type === "load") loadListeners.push(listener);
+    }),
+    dispatchLoad: () => loadListeners.splice(0).forEach((listener) => listener()),
   };
   return { target, written: () => writes.join("") };
 }
@@ -230,6 +237,23 @@ function stubWindow(openMock: ReturnType<typeof vi.fn>): void {
       return 0;
     },
   });
+}
+
+/** Hold timers so a test can assert what has and has not run yet. */
+function stubWindowWithTimers(openMock: ReturnType<typeof vi.fn>): Array<() => void> {
+  const queued: Array<() => void> = [];
+  vi.stubGlobal("window", {
+    open: openMock,
+    setTimeout: (callback: () => void) => {
+      queued.push(callback);
+      return 0;
+    },
+  });
+  return queued;
+}
+
+function runTimers(queued: Array<() => void>): void {
+  while (queued.length > 0) queued.splice(0).forEach((callback) => callback());
 }
 
 describe("printArtifact", () => {
@@ -304,6 +328,47 @@ describe("printArtifact", () => {
     expect(written()).toBe("");
     expect(target.location.replace).toHaveBeenCalledWith("/api/attachments/abc/content?raw=1");
     expect(target.print).toHaveBeenCalled();
+  });
+
+  it("waits for the file to load before printing it", () => {
+    const openMock = vi.fn();
+    const queued = stubWindowWithTimers(openMock);
+    const { target } = fakeTarget();
+    openMock.mockReturnValue(target);
+
+    printArtifact(artifact({ contentType: "application/pdf" }));
+
+    // Navigation is under way and the fallback timer is pending: not printed yet.
+    expect(target.addEventListener).toHaveBeenCalledWith(
+      "load",
+      expect.any(Function),
+      { once: true },
+    );
+    expect(target.print).not.toHaveBeenCalled();
+
+    // The file loads, the viewer gets a settle delay, then the tab is printed.
+    target.dispatchLoad();
+    expect(target.print).not.toHaveBeenCalled();
+    runTimers(queued);
+    expect(target.print).toHaveBeenCalledTimes(1);
+
+    // A late second load event must not print a second time.
+    target.dispatchLoad();
+    runTimers(queued);
+    expect(target.print).toHaveBeenCalledTimes(1);
+  });
+
+  it("prints the tab anyway when the load event never arrives", () => {
+    const openMock = vi.fn();
+    const queued = stubWindowWithTimers(openMock);
+    const { target } = fakeTarget();
+    openMock.mockReturnValue(target);
+
+    printArtifact(artifact({ contentType: "image/png", mediaKind: "image" }));
+
+    expect(target.print).not.toHaveBeenCalled();
+    runTimers(queued); // the fallback timer fires after the load timeout
+    expect(target.print).toHaveBeenCalledTimes(1);
   });
 
   it("prints text content as preformatted text", async () => {
