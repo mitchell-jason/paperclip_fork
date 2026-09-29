@@ -36,6 +36,69 @@ export function resolvePrintSource(
   return { kind: "none" };
 }
 
+/**
+ * How a file artifact gets printed, decided from its recorded content type
+ * before a single byte is fetched.
+ *
+ * - `inline`: the browser's own viewer renders the file (PDF, image) and
+ *   printing happens from there. A PDF inside a frame prints as blank pages,
+ *   which is why these are never printed in-app.
+ * - `text`: plain text, Markdown, JSON and similar are fetched and printed as
+ *   preformatted text.
+ * - `handoff`: everything else — HTML, SVG, video and binaries such as DOCX —
+ *   is handed to the browser exactly like the Open action does. Untrusted
+ *   markup is never fetched into an app-origin document, and a ZIP or DOCX is
+ *   never printed as megabytes of binary noise.
+ */
+export type ArtifactFilePrintPlan = "inline" | "text" | "handoff";
+
+const PRINTABLE_APPLICATION_TYPES = new Set([
+  "application/json",
+  "application/xml",
+  "application/x-ndjson",
+  "application/yaml",
+  "application/x-yaml",
+]);
+
+export function planFilePrint(
+  contentType: string | null | undefined,
+  mediaKind?: CompanyArtifact["mediaKind"],
+): ArtifactFilePrintPlan {
+  const type = (contentType ?? "").split(";")[0].trim().toLowerCase();
+
+  if (type) {
+    if (type.startsWith("text/html") || type.includes("svg")) return "handoff";
+    if (type === "application/pdf" || type.startsWith("image/")) return "inline";
+    if (type.startsWith("text/") || type.endsWith("+json") || type.endsWith("+xml")) return "text";
+    if (PRINTABLE_APPLICATION_TYPES.has(type)) return "text";
+    return "handoff";
+  }
+
+  if (mediaKind === "image") return "inline";
+  if (mediaKind === "text") return "text";
+  return "handoff";
+}
+
+const SAFE_URL_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
+const URL_SCHEME = /^([a-z][a-z0-9+.-]*):/i;
+
+/**
+ * Allow-list a URL before it reaches an `href` or `src`.
+ *
+ * The print document is written into a same-origin window, so a `javascript:`
+ * or `data:` URL taken from a document body would run with the app's own
+ * authority. Relative paths and fragments are kept; any other scheme is
+ * dropped so the caller renders plain text instead.
+ */
+export function safeArtifactUrl(value: string): string | null {
+  const url = value.trim().replace(/[\u0000-\u0020]+/g, "");
+  if (!url) return null;
+
+  const scheme = URL_SCHEME.exec(url);
+  if (!scheme) return url;
+  return SAFE_URL_PROTOCOLS.has(`${scheme[1].toLowerCase()}:`) ? url : null;
+}
+
 const PRINT_STYLES = [
   "html,body{background:#fff;color:#111;margin:0}",
   "body{padding:14mm 16mm;font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}",
@@ -58,30 +121,61 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;");
 }
 
+const IMAGE_PATTERN = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+const LINK_PATTERN = /\[([^\]]+)\]\(([^)\s]+)\)/g;
+
 function renderInline(markdown: string): string {
   return escapeHtml(markdown)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+    // Images first, so `![alt](url)` is never swallowed by the link pattern.
+    .replace(IMAGE_PATTERN, (_match, alt: string, url: string) => {
+      const safe = safeArtifactUrl(url);
+      return safe ? `<img src="${safe}" alt="${alt}">` : alt;
+    })
+    .replace(LINK_PATTERN, (_match, label: string, url: string) => {
+      const safe = safeArtifactUrl(url);
+      return safe
+        ? `<a href="${safe}" target="_blank" rel="noreferrer noopener">${label}</a>`
+        : label;
+    });
 }
 
 /**
  * Deliberately small Markdown subset renderer for printing issue documents:
- * headings, lists, blockquotes, fenced code, tables (as fixed-width blocks),
- * horizontal rules, paragraphs and inline code / emphasis / links. Printing a
- * document should never depend on the app shell being laid out for paper.
+ * headings, nested lists, blockquotes, fenced code, tables (as fixed-width
+ * blocks), horizontal rules, paragraphs, and inline code / emphasis / links /
+ * images. Printing a document should never depend on the app shell being laid
+ * out for paper.
  */
 export function documentMarkdownToHtml(markdown: string): string {
   const lines = markdown.replace(/\r/g, "").split("\n");
   const out: string[] = [];
   let inCode = false;
-  let listTag: "ul" | "ol" | null = null;
 
-  const closeList = () => {
-    if (listTag) {
-      out.push(`</${listTag}>`);
-      listTag = null;
+  /** Open list levels, outermost first. */
+  const listStack: Array<{ tag: "ul" | "ol"; indent: number; liOpen: boolean }> = [];
+  /** The whole list is buffered so an item and its nested list stay contiguous. */
+  let listHtml = "";
+
+  /** An `<li>` stays open so an indented child list nests inside it. */
+  const closeLi = () => {
+    const top = listStack[listStack.length - 1];
+    if (top?.liOpen) {
+      listHtml += "</li>";
+      top.liOpen = false;
+    }
+  };
+
+  const closeLists = (depth = 0) => {
+    while (listStack.length > depth) {
+      closeLi();
+      listHtml += `</${listStack.pop()!.tag}>`;
+    }
+    if (listHtml) {
+      out.push(listHtml);
+      listHtml = "";
     }
   };
 
@@ -89,7 +183,7 @@ export function documentMarkdownToHtml(markdown: string): string {
     const line = lines[index];
 
     if (/^```/.test(line.trim())) {
-      closeList();
+      closeLists();
       out.push(inCode ? "</pre>" : "<pre>");
       inCode = !inCode;
       continue;
@@ -99,11 +193,11 @@ export function documentMarkdownToHtml(markdown: string): string {
       continue;
     }
     if (!line.trim()) {
-      closeList();
+      closeLists();
       continue;
     }
     if (/^\|/.test(line.trim())) {
-      closeList();
+      closeLists();
       const rows: string[] = [];
       while (index < lines.length && /^\|/.test(lines[index].trim())) {
         rows.push(escapeHtml(lines[index].trim()));
@@ -116,43 +210,64 @@ export function documentMarkdownToHtml(markdown: string): string {
 
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (heading) {
-      closeList();
+      closeLists();
       const level = heading[1].length;
       out.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
       continue;
     }
     if (/^(---|\*\*\*|___)\s*$/.test(line.trim())) {
-      closeList();
+      closeLists();
       out.push("<hr>");
       continue;
     }
 
-    const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
-    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    const numbered = /^(\s*)\d+[.)]\s+(.*)$/.exec(line);
     if (bullet || numbered) {
       const tag = bullet ? "ul" : "ol";
-      if (listTag !== tag) {
-        closeList();
-        out.push(`<${tag}>`);
-        listTag = tag;
+      const indent = (bullet ?? numbered)![1].length;
+      const text = (bullet ?? numbered)![2];
+
+      // Close any list level this item is outdented from.
+      while (listStack.length && indent < listStack[listStack.length - 1].indent) {
+        closeLi();
+        listHtml += `</${listStack.pop()!.tag}>`;
       }
-      out.push(`<li>${renderInline((bullet ?? numbered)![1])}</li>`);
+
+      const top = listStack[listStack.length - 1];
+      if (top && indent <= top.indent) {
+        // A sibling item, possibly switching bullet style: the previous <li> ends here.
+        closeLi();
+        if (top.tag !== tag) {
+          listHtml += `</${top.tag}>`;
+          listStack.pop();
+        }
+      }
+
+      const current = listStack[listStack.length - 1];
+      if (!current || indent > current.indent) {
+        listHtml += `<${tag}>`;
+        listStack.push({ tag, indent, liOpen: false });
+      }
+
+      listHtml += `<li>${renderInline(text)}`;
+      listStack[listStack.length - 1].liOpen = true;
       continue;
     }
 
     const quote = /^>\s?(.*)$/.exec(line);
     if (quote) {
-      closeList();
+      closeLists();
       out.push(`<blockquote>${renderInline(quote[1])}</blockquote>`);
       continue;
     }
 
-    closeList();
+    closeLists();
     out.push(`<p>${renderInline(line)}</p>`);
   }
 
   if (inCode) out.push("</pre>");
-  closeList();
+  closeLists();
   return out.join("\n");
 }
 
@@ -195,20 +310,23 @@ function printWhenReady(target: Window): void {
  * Print a single artifact, without the app shell around it.
  *
  * Opened as a top-level tab on purpose: a PDF inside a frame prints as blank
- * pages, an off-screen frame is not reliably painted, and `/api/attachments/…`
- * serves HTML artifacts as `Content-Disposition: attachment` so pointing a frame
- * at the URL would download instead of render. The tab must be opened while the
- * click is still being handled, otherwise popup blockers drop it.
+ * pages, and an off-screen frame is not reliably painted. The tab must be
+ * opened while the click is still being handled, otherwise popup blockers drop
+ * it. File artifacts are printed from the URL the attachment route serves — no
+ * blob URLs, so arbitrary attachment markup never runs in an app-origin
+ * document.
  */
 export function printArtifact(artifact: CompanyArtifact): void {
+  const source = resolvePrintSource(artifact);
+  // Nothing to print: return without opening a tab, so a work product with no
+  // file and no document body never flashes an empty window.
+  if (source.kind === "none") return;
+
   const target = window.open("", "_blank");
   if (!target) {
-    const fallback = artifact.openPath ?? artifact.contentPath ?? artifact.downloadPath ?? artifact.href;
-    if (fallback) window.open(fallback, "_blank");
+    if (source.kind === "file") window.open(source.url, "_blank");
     return;
   }
-
-  const source = resolvePrintSource(artifact);
 
   if (source.kind === "document") {
     fetchDocumentMarkdown(source.issueId, source.documentKey)
@@ -227,35 +345,29 @@ export function printArtifact(artifact: CompanyArtifact): void {
     return;
   }
 
-  if (source.kind === "none") {
-    target.close();
+  const plan = planFilePrint(artifact.contentType, artifact.mediaKind);
+
+  if (plan === "inline") {
+    target.location.replace(source.url);
+    printWhenReady(target);
+    return;
+  }
+
+  if (plan === "handoff") {
+    // The attachment route decides what happens: it serves HTML and other
+    // untrusted files as a download, which is exactly what the Open action does.
+    target.location.replace(source.url);
     return;
   }
 
   fetch(source.url, { credentials: "same-origin" })
     .then((response) => {
       if (!response.ok) throw new Error(`Artifact request failed with ${response.status}`);
-      return response.blob();
+      return response.text();
     })
-    .then((blob) => {
-      const type = (blob.type || "").toLowerCase();
-      if (type.includes("html") || type.includes("pdf") || type.startsWith("image/")) {
-        const objectUrl = URL.createObjectURL(blob);
-        target.addEventListener(
-          "load",
-          () => {
-            printWhenReady(target);
-            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 120_000);
-          },
-          { once: true },
-        );
-        target.location.replace(objectUrl);
-        return;
-      }
-      blob.text().then((text) => {
-        writePrintableShell(target, artifact.title, `<pre>${escapeHtml(text)}</pre>`);
-        printWhenReady(target);
-      });
+    .then((text) => {
+      writePrintableShell(target, artifact.title, `<pre>${escapeHtml(text)}</pre>`);
+      printWhenReady(target);
     })
     .catch(() => {
       try {
