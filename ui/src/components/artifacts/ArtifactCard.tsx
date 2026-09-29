@@ -2,7 +2,7 @@ import { type SyntheticEvent, useEffect, useRef, useState } from "react";
 import { Download, ExternalLink, Paperclip, Play, Printer } from "lucide-react";
 import type { CompanyArtifact } from "@/api/artifacts";
 import { Link } from "@/lib/router";
-import { printArtifact } from "@/lib/print-artifact";
+import { printArtifact, resolvePrintSource } from "@/lib/print-artifact";
 import { cn, formatDate } from "@/lib/utils";
 
 interface ArtifactCardProps {
@@ -217,6 +217,11 @@ function SecondaryAction({
 }
 
 export function ArtifactCard({ artifact }: ArtifactCardProps) {
+  // Print only when the artifact has something to print: a file, or an issue
+  // document body. Work products with neither would print a blank sheet.
+  const printSource = resolvePrintSource(artifact);
+  const printLabel = printSource.kind === "document" ? "Print document" : "Print file";
+
   return (
     <Link
       // design-allow(card-pattern): navigation <Link> card; Card renders a div and would break anchor semantics (C5a Run 3)
@@ -247,12 +252,14 @@ export function ArtifactCard({ artifact }: ArtifactCardProps) {
                 <Download className="h-3.5 w-3.5" />
               </SecondaryAction>
             ) : null}
-            <SecondaryAction
-              onClick={() => printArtifact(artifact)}
-              title="Print file"
-            >
-              <Printer className="h-3.5 w-3.5" />
-            </SecondaryAction>
+            {printSource.kind !== "none" ? (
+              <SecondaryAction
+                onClick={() => printArtifact(artifact)}
+                title={printLabel}
+              >
+                <Printer className="h-3.5 w-3.5" />
+              </SecondaryAction>
+            ) : null}
           </div>
         </div>
 
